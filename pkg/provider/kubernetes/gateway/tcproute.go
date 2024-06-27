@@ -18,9 +18,9 @@ import (
 	gatev1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 )
 
-func (p *Provider) loadTCPRoutes(ctx context.Context, client Client, gatewayListeners []gatewayListener, conf *dynamic.Configuration) {
+func (p *Provider) loadTCPRoutes(ctx context.Context, gatewayListeners []gatewayListener, conf *dynamic.Configuration) {
 	logger := log.Ctx(ctx)
-	routes, err := client.ListTCPRoutes()
+	routes, err := p.client.ListTCPRoutes()
 	if err != nil {
 		logger.Error().Err(err).Msgf("Unable to list TCPRoutes")
 		return
@@ -64,7 +64,7 @@ func (p *Provider) loadTCPRoutes(ctx context.Context, client Client, gatewayList
 					}
 				}
 
-				routeConf, resolveRefCondition := p.loadTCPRoute(client, listener, route)
+				routeConf, resolveRefCondition := p.loadTCPRoute(listener, route)
 				if accepted && listener.Attached {
 					mergeTCPConfiguration(routeConf, conf)
 				}
@@ -79,7 +79,7 @@ func (p *Provider) loadTCPRoutes(ctx context.Context, client Client, gatewayList
 				Parents: parentStatuses,
 			},
 		}
-		if err := client.UpdateTCPRouteStatus(ctx, ktypes.NamespacedName{Namespace: route.Namespace, Name: route.Name}, routeStatus); err != nil {
+		if err := p.client.UpdateTCPRouteStatus(ctx, ktypes.NamespacedName{Namespace: route.Namespace, Name: route.Name}, routeStatus); err != nil {
 			logger.Error().
 				Err(err).
 				Msg("Unable to update TCPRoute status")
@@ -87,8 +87,8 @@ func (p *Provider) loadTCPRoutes(ctx context.Context, client Client, gatewayList
 	}
 }
 
-func (p *Provider) loadTCPRoute(client Client, listener gatewayListener, route *gatev1alpha2.TCPRoute) (*dynamic.Configuration, metav1.Condition) {
-	routeConf := &dynamic.Configuration{
+func (p *Provider) loadTCPRoute(listener gatewayListener, route *gatev1alpha2.TCPRoute) (*dynamic.Configuration, metav1.Condition) {
+	conf := &dynamic.Configuration{
 		TCP: &dynamic.TCPConfiguration{
 			Routers:           make(map[string]*dynamic.TCPRouter),
 			Middlewares:       make(map[string]*dynamic.TCPMiddleware),
@@ -97,7 +97,7 @@ func (p *Provider) loadTCPRoute(client Client, listener gatewayListener, route *
 		},
 	}
 
-	routeCondition := metav1.Condition{
+	condition := metav1.Condition{
 		Type:               string(gatev1.RouteConditionResolvedRefs),
 		Status:             metav1.ConditionTrue,
 		ObservedGeneration: route.Generation,
@@ -119,8 +119,7 @@ func (p *Provider) loadTCPRoute(client Client, listener gatewayListener, route *
 	}
 
 	// Adding the gateway desc and the entryPoint desc prevents overlapping of routers build from the same routes.
-	routerName := route.Name + "-" + listener.GWName + "-" + listener.EPName
-	routerKey := provider.Normalize(makeRouterKey("", makeID(route.Namespace, routerName)))
+	routerName := provider.Normalize(route.Namespace + "-" + route.Name + "-" + listener.GWName + "-" + listener.EPName)
 
 	var ruleServiceNames []string
 	for i, rule := range route.Spec.Rules {
@@ -130,9 +129,9 @@ func (p *Provider) loadTCPRoute(client Client, listener gatewayListener, route *
 			continue
 		}
 
-		wrrService, subServices, err := loadTCPServices(client, route.Namespace, rule.BackendRefs)
+		wrrService, subServices, err := p.loadTCPServices(route.Namespace, rule.BackendRefs)
 		if err != nil {
-			return routeConf, metav1.Condition{
+			return conf, metav1.Condition{
 				Type:               string(gatev1.RouteConditionResolvedRefs),
 				Status:             metav1.ConditionFalse,
 				ObservedGeneration: route.Generation,
@@ -143,22 +142,22 @@ func (p *Provider) loadTCPRoute(client Client, listener gatewayListener, route *
 		}
 
 		for svcName, svc := range subServices {
-			routeConf.TCP.Services[svcName] = svc
+			conf.TCP.Services[svcName] = svc
 		}
 
-		serviceName := fmt.Sprintf("%s-wrr-%d", routerKey, i)
-		routeConf.TCP.Services[serviceName] = wrrService
+		serviceName := fmt.Sprintf("%s-wrr-%d", routerName, i)
+		conf.TCP.Services[serviceName] = wrrService
 
 		ruleServiceNames = append(ruleServiceNames, serviceName)
 	}
 
 	if len(ruleServiceNames) == 1 {
 		router.Service = ruleServiceNames[0]
-		routeConf.TCP.Routers[routerKey] = &router
-		return routeConf, routeCondition
+		conf.TCP.Routers[routerName] = &router
+		return conf, condition
 	}
 
-	routeServiceKey := routerKey + "-wrr"
+	routeServiceKey := routerName + "-wrr"
 	routeService := &dynamic.TCPService{Weighted: &dynamic.TCPWeightedRoundRobin{}}
 
 	for _, name := range ruleServiceNames {
@@ -168,16 +167,16 @@ func (p *Provider) loadTCPRoute(client Client, listener gatewayListener, route *
 		routeService.Weighted.Services = append(routeService.Weighted.Services, service)
 	}
 
-	routeConf.TCP.Services[routeServiceKey] = routeService
+	conf.TCP.Services[routeServiceKey] = routeService
 
 	router.Service = routeServiceKey
-	routeConf.TCP.Routers[routerKey] = &router
+	conf.TCP.Routers[routerName] = &router
 
-	return routeConf, routeCondition
+	return conf, condition
 }
 
 // loadTCPServices is generating a WRR service, even when there is only one target.
-func loadTCPServices(client Client, namespace string, backendRefs []gatev1.BackendRef) (*dynamic.TCPService, map[string]*dynamic.TCPService, error) {
+func (p *Provider) loadTCPServices(namespace string, backendRefs []gatev1.BackendRef) (*dynamic.TCPService, map[string]*dynamic.TCPService, error) {
 	services := map[string]*dynamic.TCPService{}
 
 	wrrSvc := &dynamic.TCPService{
@@ -207,82 +206,71 @@ func loadTCPServices(client Client, namespace string, backendRefs []gatev1.Backe
 			return nil, nil, fmt.Errorf("unsupported BackendRef %s/%s/%s", *backendRef.Group, *backendRef.Kind, backendRef.Name)
 		}
 
-		svc := dynamic.TCPService{
-			LoadBalancer: &dynamic.TCPServersLoadBalancer{},
+		if backendRef.Port == nil {
+			return nil, nil, errors.New("port is required for Kubernetes Service reference")
 		}
 
-		service, exists, err := client.GetService(namespace, string(backendRef.Name))
+		service, exists, err := p.client.GetService(namespace, string(backendRef.Name))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("getting service: %w", err)
 		}
-
 		if !exists {
 			return nil, nil, errors.New("service not found")
 		}
 
-		if len(service.Spec.Ports) > 1 && backendRef.Port == nil {
-			// If the port is unspecified and the backend is a Service
-			// object consisting of multiple port definitions, the route
-			// must be dropped from the Gateway. The controller should
-			// raise the "ResolvedRefs" condition on the Gateway with the
-			// "DroppedRoutes" reason. The gateway status for this route
-			// should be updated with a condition that describes the error
-			// more specifically.
-			log.Error().Msg("A multiple ports Kubernetes Service cannot be used if unspecified backendRef.Port")
-			continue
-		}
-
-		var portSpec corev1.ServicePort
-		var match bool
-
+		var svcPort *corev1.ServicePort
 		for _, p := range service.Spec.Ports {
-			if backendRef.Port == nil || p.Port == int32(*backendRef.Port) {
-				portSpec = p
-				match = true
+			if p.Port == int32(*backendRef.Port) {
+				svcPort = &p
 				break
 			}
 		}
-
-		if !match {
-			return nil, nil, errors.New("service port not found")
+		if svcPort == nil {
+			return nil, nil, fmt.Errorf("service port %d not found", *backendRef.Port)
 		}
 
-		endpoints, endpointsExists, endpointsErr := client.GetEndpoints(namespace, string(backendRef.Name))
-		if endpointsErr != nil {
-			return nil, nil, endpointsErr
+		endpointSlices, err := p.client.ListEndpointSlicesForService(namespace, string(backendRef.Name))
+		if err != nil {
+			return nil, nil, fmt.Errorf("getting endpointslices: %w", err)
+		}
+		if len(endpointSlices) == 0 {
+			return nil, nil, errors.New("endpointslices not found")
 		}
 
-		if !endpointsExists {
-			return nil, nil, errors.New("endpoints not found")
-		}
+		svc := dynamic.TCPService{LoadBalancer: &dynamic.TCPServersLoadBalancer{}}
 
-		if len(endpoints.Subsets) == 0 {
-			return nil, nil, errors.New("subset not found")
-		}
-
-		var port int32
-		var portStr string
-		for _, subset := range endpoints.Subsets {
-			for _, p := range subset.Ports {
-				if portSpec.Name == p.Name {
-					port = p.Port
+		addresses := map[string]struct{}{}
+		for _, endpointSlice := range endpointSlices {
+			var port int32
+			for _, p := range endpointSlice.Ports {
+				if svcPort.Name == *p.Name {
+					port = *p.Port
 					break
 				}
 			}
-
 			if port == 0 {
-				return nil, nil, errors.New("cannot define a port")
+				continue
 			}
 
-			portStr = strconv.FormatInt(int64(port), 10)
-			for _, addr := range subset.Addresses {
-				svc.LoadBalancer.Servers = append(svc.LoadBalancer.Servers, dynamic.TCPServer{
-					Address: net.JoinHostPort(addr.IP, portStr),
-				})
+			for _, endpoint := range endpointSlice.Endpoints {
+				if endpoint.Conditions.Ready == nil || !*endpoint.Conditions.Ready {
+					continue
+				}
+
+				for _, address := range endpoint.Addresses {
+					if _, ok := addresses[address]; ok {
+						continue
+					}
+
+					addresses[address] = struct{}{}
+					svc.LoadBalancer.Servers = append(svc.LoadBalancer.Servers, dynamic.TCPServer{
+						Address: net.JoinHostPort(address, strconv.Itoa(int(port))),
+					})
+				}
 			}
 		}
 
-		serviceName := provider.Normalize(makeID(service.Namespace, service.Name) + "-" + portStr)
+		serviceName := provider.Normalize(service.Namespace + "-" + service.Name + "-" + strconv.Itoa(int(svcPort.Port)))
 		services[serviceName] = &svc
 
 		wrrSvc.Weighted.Services = append(wrrSvc.Weighted.Services, dynamic.TCPWRRService{Name: serviceName, Weight: &weight})
